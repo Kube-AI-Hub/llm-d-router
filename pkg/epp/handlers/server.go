@@ -181,6 +181,13 @@ type RequestContext struct {
 	respHeaderResp  *extProcPb.ProcessingResponse
 	respBodyResp    []*extProcPb.ProcessingResponse
 	respTrailerResp *extProcPb.ProcessingResponse
+
+	// inflightLeaseID is set when this stream published the running-request lease.
+	inflightLeaseID string
+	// sawResponse is true once this stream has received response headers or body.
+	sawResponse bool
+	// responseObserver is the ext_proc stream that only receives the response.
+	responseObserver bool
 }
 
 type Request struct {
@@ -365,7 +372,10 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 	// Start a single reader goroutine for the lifetime of the stream.
 	// This avoids spawning a new goroutine per message and allows the main loop to
 	// select on both incoming messages and the eviction channel.
-	recvCh := make(chan recvResult, 1)
+	// The buffer lets Recv keep the ext_proc HTTP/2 window open while response
+	// parsing lags. Observability mode only helps the model server if Envoy's
+	// send does not block on that window.
+	recvCh := make(chan recvResult, 4096)
 	// Capture the stream context's Done channel before ctx is reassigned in the main loop.
 	// This avoids a data race between the reader goroutine reading ctx and the main loop writing it.
 	streamDone := srv.Context().Done()
@@ -411,16 +421,27 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 				span.SetStatus(otelcodes.Error, reqCtx.responseStatusCode)
 			}
 		}
-		if reqCtx.requestRunning {
+		// The request filter's stream ends before the model server generates.
+		// Decrementing here would drop the in-flight count at scheduling time.
+		// The response observer adopts the lease and decrements when generation finishes.
+		if leaveInflightForObserver(reqCtx) {
+			logger.Info("request stream ended before the response; leaving in-flight count for the response observer", "requestID", reqCtx.inflightLeaseID)
+		} else if reqCtx.requestRunning {
 			metrics.DecRunningRequests(reqCtx.IncomingModelName, reqCtx.TargetModelName, fairnessID, priority)
+			releaseInflightLease(reqCtx.inflightLeaseID)
 		}
 
-		// If we scheduled a pod (TargetPod != nil) but never marked the response  as complete (e.g. error, disconnect,
-		// panic), force the completion hooks to run.
-		if reqCtx.TargetPod != nil && !reqCtx.responseComplete {
+		// If we scheduled a pod (TargetPod != nil) but never marked the response as complete (e.g. error, disconnect,
+		// panic), force the completion hooks to run. Skip this on the request-only
+		// stream: the observer still has the body.
+		if !leaveInflightForObserver(reqCtx) && reqCtx.TargetPod != nil && !reqCtx.responseComplete {
 			reqCtx.TerminationCause = terminationCause(reqCtx, ctx.Err())
 			// Use a fresh context as the request context might be canceled (Client Disconnect).
 			// We only need logging from the original context.
+			cleanupCtx := log.IntoContext(context.Background(), logger)
+			s.director.HandleResponseBody(cleanupCtx, reqCtx, true)
+		}
+		if reqCtx.responseObserver && !reqCtx.responseComplete {
 			cleanupCtx := log.IntoContext(context.Background(), logger)
 			s.director.HandleResponseBody(cleanupCtx, reqCtx, true)
 		}
@@ -557,6 +578,26 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 		case *extProcPb.ProcessingRequest_RequestTrailers:
 			// This is currently unused.
 		case *extProcPb.ProcessingRequest_ResponseHeaders:
+			reqCtx.sawResponse = true
+			if req.GetObservabilityMode() {
+				reqCtx.responseObserver = true
+				if !reqCtx.requestRunning {
+					requestID := requestIDFromProcessingRequest(req)
+					if requestID == "" {
+						for _, header := range v.ResponseHeaders.Headers.GetHeaders() {
+							if strings.EqualFold(header.Key, reqcommon.RequestIDHeaderKey) {
+								requestID = string(header.RawValue)
+								break
+							}
+						}
+					}
+					if adoptInflightLease(reqCtx, requestID) {
+						logger.Info("response observer adopted in-flight lease", "requestID", requestID, "model", reqCtx.IncomingModelName)
+					} else {
+						logger.Info("response observer did not find an in-flight lease", "requestID", requestID)
+					}
+				}
+			}
 			// Overwrites the request-phase value on purpose. Response-received plugins
 			// read this through Response.ReqMetadata to learn which endpoint actually
 			// served the request, and Envoy only reports that at the response phase.
@@ -587,6 +628,13 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 			reqCtx.responseProcessingDuration += time.Since(respHeadersReceivedAt)
 
 		case *extProcPb.ProcessingRequest_ResponseBody:
+			reqCtx.sawResponse = true
+			if req.GetObservabilityMode() && !reqCtx.requestRunning {
+				reqCtx.responseObserver = true
+				if !adoptInflightLease(reqCtx, requestIDFromProcessingRequest(req)) {
+					logger.V(logutil.DEBUG).Info("response body arrived before an in-flight lease was visible")
+				}
+			}
 			endOfStream := v.ResponseBody.EndOfStream
 			chunk := v.ResponseBody.Body
 
@@ -597,10 +645,20 @@ func (s *StreamingServer) Process(srv extProcPb.ExternalProcessor_ProcessServer)
 					reqCtx.responseCompleteTimestamp = time.Now()
 				}
 				s.HandleResponseBody(ctx, reqCtx, chunk, endOfStream)
-				// Rewrite the model name in response body back to the original client-facing name.
-				chunk, _ = rewriteModelName(chunk, reqCtx.TargetModelName, reqCtx.IncomingModelName)
-				// For streaming response, we send response chunk back to envoy every time we received it.
-				reqCtx.respBodyResp = generateResponseBodyResponses(chunk, endOfStream, reqCtx.Response.DynamicMetadata)
+				if req.GetObservabilityMode() {
+					// Envoy already forwarded these bytes and ignores the reply.
+					// Skipping the echo keeps this stream from writing a gRPC
+					// message per token.
+					reqCtx.respBodyResp = nil
+					if endOfStream {
+						logger.V(logutil.DEFAULT).Info("EPP sent response body back to proxy")
+					}
+				} else {
+					// Rewrite the model name in response body back to the original client-facing name.
+					chunk, _ = rewriteModelName(chunk, reqCtx.TargetModelName, reqCtx.IncomingModelName)
+					// For streaming response, we send response chunk back to envoy every time we received it.
+					reqCtx.respBodyResp = generateResponseBodyResponses(chunk, endOfStream, reqCtx.Response.DynamicMetadata)
+				}
 				reqCtx.responseProcessingDuration += time.Since(respBodyStart)
 			} else {
 				respBody = append(respBody, chunk...)
@@ -785,6 +843,7 @@ func (r *RequestContext) updateStateAndSendIfNeeded(srv extProcPb.ExternalProces
 		fairnessID, priority := extractFairnessAndPriority(r)
 		metrics.IncRunningRequests(r.IncomingModelName, r.TargetModelName, fairnessID, priority)
 		r.requestRunning = true
+		publishInflightLease(r)
 		// Dump the response so a new stream message can begin
 		r.reqBodyResp = nil
 	}
