@@ -94,6 +94,16 @@ func (s *Server) disaggregatedPrefillHandler(apiType reqcommon.APIType) http.Han
 				prefillHostPort = strings.TrimSpace(prefillHostPorts[0])
 			}
 		}
+		// A colocated deployment runs prefill and decode in the same pod and has
+		// no EPP to stamp the header, so fall back to the configured sibling
+		// engine. The static target is trusted and skips the pool allowlist,
+		// which only ever contains this pod's own address in that topology.
+		staticPrefiller := false
+		if len(prefillHostPort) == 0 && s.config.PrefillerHost != "" {
+			prefillHostPort = s.config.PrefillerHost
+			staticPrefiller = true
+			numHosts = 1
+		}
 
 		if len(prefillHostPort) == 0 {
 			logger.V(logging.DEBUG).Info("skip disaggregated prefill", "api", apiType.String())
@@ -109,7 +119,7 @@ func (s *Server) disaggregatedPrefillHandler(apiType reqcommon.APIType) http.Han
 			)
 		}
 
-		if len(prefillHostPort) > 0 {
+		if len(prefillHostPort) > 0 && !staticPrefiller {
 			if !s.allowlistValidator.IsAllowed(prefillHostPort) {
 				logger.Error(nil, "SSRF protection: prefill target not in allowlist",
 					"target", prefillHostPort,

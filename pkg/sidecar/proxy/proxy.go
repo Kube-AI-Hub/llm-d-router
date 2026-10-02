@@ -61,6 +61,11 @@ type Config struct {
 
 	// KVConnector is the name of the KV protocol between prefiller and decoder.
 	KVConnector string
+	// PrefillerHost is a static prefill target (host:port) used when a request
+	// carries no prefill endpoint header. A colocated deployment sets it to the
+	// sibling prefill engine inside the same pod, so no EPP has to schedule the
+	// prefill leg.
+	PrefillerHost string
 	// ECConnector is the name of the EC protocol between encoder and prefiller (for EPD mode).
 	// If empty, encoder stage is skipped.
 	ECConnector string

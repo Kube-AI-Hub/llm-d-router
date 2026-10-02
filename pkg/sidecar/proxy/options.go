@@ -61,6 +61,7 @@ const (
 	dataParallelSize          = "data-parallel-size"
 	kvConnector               = "kv-connector"
 	ecConnector               = "ec-connector"
+	prefillerHost             = "prefiller-host"
 	mooncakeBootstrapPortFlag = "mooncake-bootstrap-port"
 	p2pConnectorPortFlag      = "p2p-connector-port"
 	enableP2PPull             = "enable-p2p-pull"
@@ -121,6 +122,7 @@ type yamlConfiguration struct {
 	DataParallelSize        int      `json:"data-parallel-size,omitempty"`
 	KVConnector             string   `json:"kv-connector,omitempty"`
 	ECConnector             string   `json:"ec-connector,omitempty"`
+	PrefillerHost           string   `json:"prefiller-host,omitempty"`
 	EnableSSRFProtection    *bool    `json:"enable-ssrf-protection,omitempty"`
 	EnablePrefillerSampling *bool    `json:"enable-prefiller-sampling,omitempty"`
 	EnableP2PPull           *bool    `json:"enable-p2p-pull,omitempty"`
@@ -277,6 +279,9 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&opts.DataParallelSize, dataParallelSize, opts.DataParallelSize, "the model server's data-parallel size")
 	fs.StringVar(&opts.KVConnector, kvConnector, opts.KVConnector,
 		"the KV protocol between prefiller and decoder. Supported: "+supportedKVConnectorNamesStr)
+	fs.StringVar(&opts.PrefillerHost, prefillerHost, opts.PrefillerHost,
+		"static prefill target (host:port) used when the request carries no "+routing.PrefillEndpointHeader+
+			" header. Set it for a colocated deployment where prefill and decode run in the same pod and no EPP schedules the prefill leg.")
 	fs.StringVar(&opts.ECConnector, ecConnector, opts.ECConnector,
 		"the EC protocol between encoder and prefiller (for EPD mode). Supported: "+supportedECConnectorNamesStr+". Leave empty to skip encoder stage.")
 	fs.IntVar(&opts.MooncakeBootstrapPort, mooncakeBootstrapPortFlag, opts.MooncakeBootstrapPort,
@@ -676,6 +681,14 @@ func (opts *Options) Validate() error {
 		return fmt.Errorf("--kv-connector must be one of: %s", supportedKVConnectorNamesStr)
 	}
 
+	// A static prefiller must be host:port; it is dialled on every request that
+	// carries no prefill header, so a malformed value would fail at runtime.
+	if opts.PrefillerHost != "" {
+		if !isHostPort(opts.PrefillerHost) {
+			return fmt.Errorf("--%s must be host:port, got %q", prefillerHost, opts.PrefillerHost)
+		}
+	}
+
 	// Validate EC connector if provided
 	if opts.ECConnector != "" {
 		if _, ok := supportedECConnectors[opts.ECConnector]; !ok {
@@ -837,6 +850,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 
 	if cfg.KVConnector != "" && !opts.isFlagSet(kvConnector) {
 		opts.KVConnector = cfg.KVConnector
+	}
+	if cfg.PrefillerHost != "" && !opts.isFlagSet(prefillerHost) {
+		opts.PrefillerHost = cfg.PrefillerHost
 	}
 	if cfg.ECConnector != "" && !opts.isFlagSet(ecConnector) {
 		opts.ECConnector = cfg.ECConnector
