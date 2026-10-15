@@ -230,6 +230,96 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		Expect(cachedTokensFromResponse(response)).To(BeNumerically("==", 0))
 	})
 
+	It("should ask prefill to echo the prompt token ids", func() {
+		proxyBaseAddr := startProxy()
+
+		_ = sendChatCompletionsRequest(proxyBaseAddr)
+
+		prefillRequests := testInfo.prefillHandler.GetCompletionRequests()
+		Expect(prefillRequests).To(HaveLen(1))
+		Expect(prefillRequests[0]).To(HaveKeyWithValue(reqcommon.FieldReturnTokenIds, true))
+	})
+
+	It("should hand the prefill prompt token ids to decode so it skips tokenizing", func() {
+		testInfo.prefillHandler.RawResponse = `{"prompt_token_ids":[11,22,33,44],"kv_transfer_params":{"remote_block_ids":[1,2,3],"remote_engine_id":"5b5fb28f-3f30-4bdd-9a36-958d52459200","remote_host":"ahost","remote_port":4032},"usage":{"prompt_tokens":64,"completion_tokens":1,"total_tokens":65,"prompt_tokens_details":{}}}`
+		proxyBaseAddr := startProxy()
+
+		_ = sendChatCompletionsRequest(proxyBaseAddr)
+
+		decodeRequests := testInfo.decodeHandler.GetCompletionRequests()
+		Expect(decodeRequests).To(HaveLen(1))
+		kvParams, ok := decodeRequests[0][reqcommon.FieldKVTransferParams].(map[string]any)
+		Expect(ok).To(BeTrue())
+		Expect(kvParams[reqcommon.FieldPromptTokenIds]).
+			To(Equal([]any{float64(11), float64(22), float64(33), float64(44)}))
+	})
+
+	It("should leave the decode request alone when prefill reports no prompt token ids", func() {
+		proxyBaseAddr := startProxy()
+
+		_ = sendChatCompletionsRequest(proxyBaseAddr)
+
+		decodeRequests := testInfo.decodeHandler.GetCompletionRequests()
+		Expect(decodeRequests).To(HaveLen(1))
+		kvParams, ok := decodeRequests[0][reqcommon.FieldKVTransferParams].(map[string]any)
+		Expect(ok).To(BeTrue())
+		Expect(kvParams).ToNot(HaveKey(reqcommon.FieldPromptTokenIds))
+	})
+
+	DescribeTable("promptTokenIdsRaw keeps usable arrays verbatim",
+		func(raw, expected string) {
+			fields := map[string]json.RawMessage{
+				"prompt_token_ids": json.RawMessage(raw),
+			}
+			// The bytes must survive untouched: they are forwarded to decode as-is.
+			Expect(string(promptTokenIdsRaw(fields))).To(Equal(expected))
+		},
+		Entry("small list", `[1,2,3]`, `[1,2,3]`),
+		Entry("large ids stay exact", `[671031,160491,7]`, `[671031,160491,7]`),
+		Entry("padding is preserved", ` [1,2] `, ` [1,2] `),
+	)
+
+	DescribeTable("promptTokenIdsRaw rejects unusable input",
+		func(raw string) {
+			fields := map[string]json.RawMessage{}
+			if raw != "<absent>" {
+				fields["prompt_token_ids"] = json.RawMessage(raw)
+			}
+			Expect(promptTokenIdsRaw(fields)).To(BeNil())
+		},
+		Entry("absent field", "<absent>"),
+		Entry("empty list", `[]`),
+		Entry("whitespace-only list", `[ ]`),
+		Entry("not a list", `"1,2"`),
+		Entry("object", `{"a":1}`),
+		Entry("truncated array", `[1,2,`),
+		Entry("malformed array", `[1,2,]`),
+	)
+
+	DescribeTable("decodePrefillResponse decodes only the inspected fields",
+		func(body string, wantKV bool, wantUsage bool) {
+			fields, parsed, err := decodePrefillResponse([]byte(body))
+			Expect(err).ToNot(HaveOccurred())
+			_, gotKV := parsed[reqcommon.FieldKVTransferParams]
+			_, gotUsage := parsed[reqcommon.FieldUsage]
+			Expect(gotKV).To(Equal(wantKV))
+			Expect(gotUsage).To(Equal(wantUsage))
+			// The id array must stay raw rather than become a []any.
+			if _, ok := fields[reqcommon.FieldPromptTokenIds]; ok {
+				Expect(parsed).ToNot(HaveKey(reqcommon.FieldPromptTokenIds))
+			}
+		},
+		Entry("kv and usage", `{"kv_transfer_params":{"a":1},"usage":{"prompt_tokens":1}}`, true, true),
+		Entry("only kv", `{"kv_transfer_params":{}}`, true, false),
+		Entry("only usage", `{"usage":{}}`, false, true),
+		Entry("neither", `{"model":"m","prompt_token_ids":[1,2]}`, false, false),
+	)
+
+	It("should reject a prefill response that is not a JSON object", func() {
+		_, _, err := decodePrefillResponse([]byte(`[1,2,3]`))
+		Expect(err).To(HaveOccurred())
+	})
+
 	It("should overwrite decoder cached tokens when prefiller reports zero cached tokens", func() {
 		testInfo.prefillHandler.RawResponse = `{"kv_transfer_params":{"remote_block_ids":[1,2,3],"remote_engine_id":"5b5fb28f-3f30-4bdd-9a36-958d52459200","remote_host":"ahost","remote_port":4032},"usage":{"prompt_tokens":64,"completion_tokens":1,"total_tokens":65,"prompt_tokens_details":{"cached_tokens":0}}}`
 		testInfo.decodeHandler.RawResponse = `{"id":"chatcmpl-test","object":"chat.completion","choices":[],"usage":{"prompt_tokens":64,"completion_tokens":1,"total_tokens":65,"prompt_tokens_details":{"cached_tokens":49}}}`

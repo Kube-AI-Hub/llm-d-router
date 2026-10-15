@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -106,6 +107,11 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 
 	// Keeps the client's body intact for the decode request below.
 	prefillRequest := maps.Clone(body)
+
+	// Ask prefill to echo the prompt's token ids. Decode then reuses them instead
+	// of templating and tokenizing the same prompt a second time; see the
+	// kv_transfer_params.prompt_token_ids hand-off at the decode stage below.
+	prefillRequest[reqcommon.FieldReturnTokenIds] = true
 
 	// WRITE mode populates the destination fields the prefill engine needs for
 	// its RDMA Write; READ mode leaves them nil per the standard NIXLv2 contract.
@@ -246,9 +252,15 @@ retryLoop:
 	}
 	prefillSpan.End()
 
-	// Process response - extract p/d fields
-	var prefillerResponse map[string]any
-	if err := json.Unmarshal(pw.bodyBytes(), &prefillerResponse); err != nil {
+	// Process response - extract p/d fields.
+	//
+	// Parsed field-by-field rather than wholesale: the response carries the
+	// prompt's token ids, which for a long context is an array of hundreds of
+	// thousands of ints. Decoding that into []any and formatting it back into the
+	// outgoing body measured ~150 ms per request at 671k tokens, so the array is
+	// kept as raw bytes and forwarded untouched.
+	responseFields, prefillerResponse, err := decodePrefillResponse(pw.bodyBytes())
+	if err != nil {
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client")
 		}
@@ -261,6 +273,9 @@ retryLoop:
 	if !ok {
 		s.logger.Info("warning: missing 'kv_transfer_params' field in prefiller response")
 	}
+	// Prompt ids the prefill stage computed while templating and tokenizing. They
+	// are handed to decode below so it does not repeat that work.
+	pPromptTokenIds := promptTokenIdsRaw(responseFields)
 	pCachedTokens, hasPCachedTokens := extractCachedTokens(prefillerResponse)
 	if !hasPCachedTokens {
 		// vLLM returns prompt_tokens_details as null when cached_tokens is 0,
@@ -364,6 +379,21 @@ retryLoop:
 					}
 				}
 			}
+		}
+	}
+	// Hand the prefill stage's prompt ids to decode. vLLM pops
+	// kv_transfer_params.prompt_token_ids and, when present, skips chat templating
+	// and tokenization on the decode side, reusing the ids prefill already
+	// computed. Without it every P/D request tokenizes its prompt twice: once in
+	// prefill and once in decode, which is the largest CPU cost of ingesting a
+	// long context.
+	//
+	// Missing ids (an engine that did not echo them, or kv_transfer_params that is
+	// not an object) leave the request untouched, so decode falls back to
+	// templating and tokenizing as before.
+	if len(pPromptTokenIds) > 0 {
+		if dKV, kvOK := pKVTransferParams.(map[string]any); kvOK {
+			dKV[reqcommon.FieldPromptTokenIds] = pPromptTokenIds
 		}
 	}
 	body[reqcommon.FieldKVTransferParams] = pKVTransferParams
@@ -820,6 +850,72 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 			s.logger.Error(err, "failed to send decode abort error to client (concurrent-dispatch)")
 		}
 	}
+}
+
+// prefillInspectedResponseFields lists the prefill-response fields the sidecar
+// reads as Go values. Everything else stays a json.RawMessage and is forwarded
+// without being decoded, which matters most for prompt_token_ids: for a long
+// context that array is hundreds of thousands of ints, and the decode/encode round
+// trip through []any measured ~200 ms of a 671k-token request on the target host.
+var prefillInspectedResponseFields = map[string]struct{}{
+	reqcommon.FieldKVTransferParams: {},
+	reqcommon.FieldUsage:            {},
+}
+
+// decodePrefillResponse splits a prefill response into its raw fields and the
+// decoded values of the fields the sidecar inspects. The raw map is cheap: it
+// only records where each value's bytes are.
+func decodePrefillResponse(raw []byte) (map[string]json.RawMessage, map[string]any, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, nil, err
+	}
+	if fields == nil {
+		return nil, nil, errors.New("prefill response is not a JSON object")
+	}
+	parsed := make(map[string]any, len(prefillInspectedResponseFields))
+	for key := range prefillInspectedResponseFields {
+		value, ok := fields[key]
+		if !ok {
+			continue
+		}
+		var decoded any
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			return nil, nil, err
+		}
+		parsed[key] = decoded
+	}
+	return fields, parsed, nil
+}
+
+// promptTokenIdsRaw returns the prompt token ids an engine echoed on its response
+// (asked for with FieldReturnTokenIds) as the original JSON bytes, or nil.
+//
+// The bytes are forwarded verbatim instead of being decoded into []int64 and
+// re-marshaled: the array is as large as the prompt, and encoding/json represents
+// every element as a float64 that then has to be formatted back to text. json.Valid
+// scans the array without allocating, so a malformed one is still rejected rather
+// than passed on to the decode engine.
+//
+// A missing, empty, or non-array field returns nil, which leaves the caller
+// tokenizing on the decode side as before.
+func promptTokenIdsRaw(fields map[string]json.RawMessage) json.RawMessage {
+	raw, ok := fields[reqcommon.FieldPromptTokenIds]
+	if !ok {
+		return nil
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 3 || trimmed[0] != '[' || trimmed[len(trimmed)-1] != ']' {
+		return nil
+	}
+	if len(bytes.TrimSpace(trimmed[1:len(trimmed)-1])) == 0 {
+		// "[]" carries no ids.
+		return nil
+	}
+	if !json.Valid(trimmed) {
+		return nil
+	}
+	return raw
 }
 
 // truncate shortens s to at most n characters, appending "..." if truncated.

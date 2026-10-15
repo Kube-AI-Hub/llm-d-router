@@ -28,8 +28,15 @@ const (
 	// use the same revision.
 	RevisionDecisionIDHeaderKey = "x-llm-d-revision-decision-id"
 
-	FieldKVTransferParams     = "kv_transfer_params"
-	FieldECTransferParams     = "ec_transfer_params"
+	FieldKVTransferParams = "kv_transfer_params"
+	FieldECTransferParams = "ec_transfer_params"
+	// FieldReturnTokenIds asks the engine to echo the prompt's token ids on the
+	// response, which is how the prefill stage hands its tokenization to decode.
+	FieldReturnTokenIds = "return_token_ids"
+	// FieldPromptTokenIds carries those ids. On a response it is a top-level
+	// field; inside kv_transfer_params on a decode request it tells vLLM to skip
+	// templating and tokenization and reuse the prefill stage's ids.
+	FieldPromptTokenIds       = "prompt_token_ids"
 	FieldMaxTokens            = "max_tokens"
 	FieldMaxCompletionTokens  = "max_completion_tokens"
 	FieldMaxOutputTokens      = "max_output_tokens" // Used by Responses API
