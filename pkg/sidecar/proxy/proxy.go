@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -546,14 +547,95 @@ func (s *Server) setECConnector() {
 	}
 }
 
+// healthHandler reports Ready only when both engines answer their own /health.
+//
+// The sidecar is one container in a two-engine pod, and it starts long before
+// either vLLM finishes loading 475 GiB of weights. Answering 200 unconditionally
+// (the previous behaviour) marked the pod Ready while `/v1/models` still returned
+// "The decode node is not ready", so the Service routed real traffic into a pod
+// that could only fail it. Probing the legs costs one localhost request each per
+// kubelet check and makes the readiness signal mean what it says.
+func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+
+	type leg struct {
+		name string
+		url  string
+	}
+	legs := []leg{}
+	if s.config.DecoderURL != nil {
+		legs = append(legs, leg{"decode", s.engineHealthURL(s.config.DecoderURL.Scheme, s.config.DecoderURL.Host)})
+	}
+	if host := strings.TrimSpace(s.config.PrefillerHost); host != "" {
+		scheme := "http"
+		if s.config.DecoderURL != nil && s.config.DecoderURL.Scheme != "" {
+			scheme = s.config.DecoderURL.Scheme
+		}
+		legs = append(legs, leg{"prefill", s.engineHealthURL(scheme, host)})
+	}
+	if len(legs) == 0 {
+		// Nothing to probe (no disaggregation configured): the sidecar itself is
+		// the whole data path, so being able to answer is being healthy.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	var down []string
+	for _, l := range legs {
+		if err := s.probeHealth(ctx, l.url); err != nil {
+			down = append(down, l.name+": "+err.Error())
+		}
+	}
+	if len(down) > 0 {
+		s.logger.V(1).Info("health probe failed", "down", down)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"unavailable","detail":` + strconv.Quote(strings.Join(down, "; ")) + `}`))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) engineHealthURL(scheme, host string) string {
+	if scheme == "" {
+		scheme = "http"
+	}
+	return scheme + "://" + host + "/health"
+}
+
+func (s *Server) probeHealth(ctx context.Context, target string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := sidecarHealthClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// sidecarHealthClient is shared by every health probe: the kubelet calls this
+// endpoint repeatedly for the life of the pod, and a client per call would leak
+// idle connections. The timeout bounds one probe; the handler's context bounds
+// the pair.
+var sidecarHealthClient = &http.Client{Timeout: 2 * time.Second}
+
 func (s *Server) createRoutes() *http.ServeMux {
 	// Configure handlers
 	mux := http.NewServeMux()
 
 	// Intercept chat requests
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+	// A sidecar that answers 200 before its engines are up makes the pod Ready
+	// while every request still fails with "decode node is not ready": the
+	// kubelet has nothing else to go on, so the pod joins the Service and
+	// receives traffic that it cannot serve. Probe both legs instead.
+	mux.HandleFunc("GET /health", s.healthHandler)
 	// DetectAPIType owns the path-to-API mapping; deriving it here keeps the
 	// served routes from drifting away from it.
 	for _, path := range []string{reqcommon.PathChatCompletions, reqcommon.PathCompletions, reqcommon.PathMessages, reqcommon.PathResponses, reqcommon.PathVLLMGenerate, reqcommon.PathSGLangGenerate} {
