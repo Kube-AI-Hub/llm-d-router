@@ -4,9 +4,14 @@
 # NOTE: if using scratch, CA certificates must be copied from the builder stage:
 #   COPY --from=builder /etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt
 ARG BASE_IMAGE=gcr.io/distroless/static:nonroot
+# BUILDER_IMAGE can be overridden to build from a registry mirror, e.g.
+#   --build-arg BUILDER_IMAGE=registry.example.com/golang:1.26.8
+# The default keeps upstream behaviour; mirrors are needed where Docker Hub is
+# not reachable at build time.
+ARG BUILDER_IMAGE=golang:1.26.8
 
 # Build Stage: using Go 1.26.6 image
-FROM --platform=${BUILDPLATFORM} golang:1.26.8 AS builder
+FROM --platform=${BUILDPLATFORM} ${BUILDER_IMAGE} AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
